@@ -43,30 +43,22 @@ class BERTDataset(Dataset):
         t1 = [self.vocab.sos_index] + t1_random + [self.vocab.eos_index]
         t2 = t2_random + [self.vocab.eos_index]
 
-        t1_label = [self.vocab.pad_index] + t1_label + [self.vocab.pad_index]
-        t2_label = t2_label + [self.vocab.pad_index]
-
-        segment_label = ([1 for _ in range(len(t1))] + [2 for _ in range(len(t2))])[:self.seq_len]
         bert_input = (t1 + t2)[:self.seq_len]
-        bert_label = (t1_label + t2_label)[:self.seq_len]
 
         padding = [self.vocab.pad_index for _ in range(self.seq_len - len(bert_input))]
-        bert_input.extend(padding), bert_label.extend(padding), segment_label.extend(padding)
+        bert_input.extend(padding)
 
-        output = {"bert_input": bert_input,
-                  "bert_label": bert_label,
-                  "segment_label": segment_label,
-                  "is_next": is_next_label}
+        output = {"bert_input": bert_input}
 
         return {key: torch.tensor(value) for key, value in output.items()}
 
-    def random_word(self, sentence):
+    def random_word(self, sentence, already):
         tokens = sentence.split()
         output_label = []
 
         for i, token in enumerate(tokens):
             prob = random.random()
-            if prob < 0.15:
+            if prob < 0.15 and token not in already:
                 prob /= 0.15
 
                 # 80% randomly change token to mask token
@@ -93,10 +85,11 @@ class BERTDataset(Dataset):
         t1, t2 = self.get_corpus_line(index)
 
         # output_text, label(isNotNext:0, isNext:1)
-        if random.random() > 0.5:
-            return t1, t2, 1
-        else:
-            return t1, self.get_random_line(), 0
+        return t1, t2, 1
+        # if random.random() > 0.5:
+        #     return t1, t2, 1
+        # else:
+        #     return t1, self.get_random_line(), 0
 
     def get_corpus_line(self, item):
         if self.on_memory:
