@@ -6,8 +6,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from torchvision import transforms as T
-
 # helper functions
 
 def default(val, def_val):
@@ -116,7 +114,8 @@ class NetWrapper(nn.Module):
 
     def _hook(self, _, input, output):
         device = input[0].device
-        self.hidden[device] = flatten(output)
+        # self.hidden[device] = flatten(output)
+        self.hidden[device] = output
 
     def _register_hook(self):
         layer = self._find_layer()
@@ -126,6 +125,7 @@ class NetWrapper(nn.Module):
 
     @singleton('projector')
     def _get_projector(self, hidden):
+        # print(hidden.shape)
         _, dim = hidden.shape
         projector = MLP(dim, self.projection_size, self.projection_hidden_size)
         return projector.to(hidden)
@@ -146,8 +146,8 @@ class NetWrapper(nn.Module):
         return hidden
 
     def forward(self, x, return_embedding = False):
-        representation = self.get_representation(x)
-
+        representation = self.get_representation(x)[:, 0]
+        # print(representation.shape)
         if return_embedding:
             return representation
 
@@ -185,7 +185,7 @@ class BYOL(nn.Module):
         self.to(device)
 
         # send a mock image tensor to instantiate singleton parameters
-        self.forward(torch.randn(2, sequence_size, encoder_size, device=device))
+        self.forward(torch.randint(0, 1000, (3, 2, sequence_size), device=device))
 
     @singleton('target_encoder')
     def _get_target_encoder(self):
@@ -202,11 +202,11 @@ class BYOL(nn.Module):
         assert self.target_encoder is not None, 'target encoder has not been created yet'
         update_moving_average(self.target_ema_updater, self.target_encoder, self.online_encoder)
 
-    def forward(self, x, return_embedding = False):
+    def forward(self, x, return_embedding=False):
         if return_embedding:
             return self.online_encoder(x)
 
-        sentence1, sentence2 = self.masking(x)
+        sentence1, sentence2 = x[:, 0], x[:, 1]
 
         online_proj_one, _ = self.online_encoder(sentence1)
         online_proj_two, _ = self.online_encoder(sentence2)

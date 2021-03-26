@@ -1,1 +1,3 @@
-from .model import BERT
+from .model import BERT, BYOL
+from .dataset import dataset
+

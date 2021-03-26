@@ -27,6 +27,6 @@ class BERTEmbedding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         self.embed_size = embed_size
 
-    def forward(self, sequence, segment_label):
-        x = self.token(sequence) + self.position(sequence) + self.segment(segment_label)
+    def forward(self, sequence):
+        x = self.token(sequence) + self.position(sequence)
         return self.dropout(x)

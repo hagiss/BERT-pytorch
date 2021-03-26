@@ -2,10 +2,10 @@ from datasets import load_dataset, concatenate_datasets
 from transformers import BertTokenizer
 import os
 import random
-import simplejson
 import argparse
 import time
 import multiprocessing
+import numpy as np
 
 # bookcorpus = load_dataset("bookcorpus", ignore_verifications=True, split="train")
 # print(bookcorpus[0])
@@ -26,38 +26,102 @@ def write_examples(job_id, data, args):
     num_jobs = args.num_processes
 
     start_time = time.time()
+    target_length = seq_len
+
+    folder_num = 0
+    folder = os.path.join(args.output_dir, "{:}".format(folder_num * num_jobs + job_id))
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    file_num = 0
 
     for (i, document) in enumerate(data):
-        output_fname = os.path.join(args.output_dir, "wiki-{:}".format(i*num_jobs+job_id))
 
-        with open(output_fname, "w") as f:
-            total_sentence = []
-            current_sentences = [vocab["[CLS]"]]
-            current_length = 1
+        if file_num > 5000:
+            folder_num += 1
+            folder = os.path.join(args.output_dir, "{:}".format(folder_num * num_jobs + job_id))
+            file_num = 0
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+        file_num += 1
+        fname = os.path.join(folder, "wiki_np-{:}".format(i))
+        total_sentence = []
+        current_sentences = []
+        current_length = 0
 
-            target_length = seq_len
+        for line in document.replace("\n\n", '\n').split("\n"):
+            line = line.strip()
+            bert_tokens = tokenizer.tokenize(line)
+            bert_tokids = [vocab[token] for token in bert_tokens]
+            current_sentences.append(bert_tokids)
+            current_length += len(bert_tokids)
 
-            for line in document.split("\n\n"):
-                line = line.strip().replace("\n", ' ')
-                bert_tokens = tokenizer.tokenize(line)
-                bert_tokids = [vocab[token] for token in bert_tokens]
-                current_sentences += bert_tokids
-                current_length += len(bert_tokids)
+            if current_length >= target_length:
+                first_segment_target_length = (target_length - 3) // 2
 
-                if current_length >= target_length:
-                    # sentence = [vocab["[CLS]"] + current_sentences[:target_length-5]
-                    total_sentence.append(current_sentences)
+                first_segment = []
+                second_segment = []
 
-                    if random.random() < 0.05:
-                        target_length = random.randint(5, seq_len)
+                for sentence in current_sentences:
+                    if (len(first_segment) == 0 or
+                            len(first_segment) + len(sentence) < first_segment_target_length or
+                            (len(second_segment) == 0 and
+                             len(first_segment) < first_segment_target_length and
+                             random.random() < 0.5)):
+                        first_segment += sentence
                     else:
-                        target_length = seq_len
+                        second_segment += sentence
 
-                    current_sentences = [vocab["[CLS]"]]
-                    current_length = 1
 
-            simplejson.dump(total_sentence, f)
-            f.close()
+
+                # sentence = [vocab["[CLS]"] + current_sentences[:target_length-5]
+                # total_sentence.append(current_sentences)
+                first_segment = first_segment[:seq_len - 2]
+                second_segment = second_segment[:max(0, seq_len - len(first_segment) - 3)]
+                segments = [vocab["[CLS]"]] + first_segment + [vocab["[SEP]"]] + second_segment + (
+                    [vocab["[SEP]"]] if len(second_segment) > 0 else [])
+                total_sentence.append(segments + [vocab["[PAD]"] for _ in range(seq_len - len(segments))])
+
+                if random.random() < 0.05:
+                    target_length = random.randint(5, seq_len)
+                else:
+                    target_length = seq_len
+
+                current_sentences = []
+                current_length = 0
+
+        if current_length != 0:
+            first_segment_target_length = (target_length - 3) // 2
+
+            first_segment = []
+            second_segment = []
+
+            for sentence in current_sentences:
+                if (len(first_segment) == 0 or
+                        len(first_segment) + len(sentence) < first_segment_target_length or
+                        (len(second_segment) == 0 and
+                         len(first_segment) < first_segment_target_length and
+                         random.random() < 0.5)):
+                    first_segment += sentence
+                else:
+                    second_segment += sentence
+            first_segment = first_segment[:seq_len - 2]
+            second_segment = second_segment[:max(0, seq_len - len(first_segment) - 3)]
+            segments = [vocab["[CLS]"]] + first_segment + [vocab["[SEP]"]] + second_segment + (
+                [vocab["[SEP]"]] if len(second_segment) > 0 else [])
+            total_sentence.append(segments + [vocab["[PAD]"] for _ in range(seq_len - len(segments))])
+        if len(total_sentence) == 0:
+            raise
+        # for i in total_sentence:
+        #     if len(i) > 128:
+        #         print(i)
+        #     print(len(i))
+        # print(total_sentence)
+        total_sentence = np.array(total_sentence, dtype=np.int16)
+        # with open(os.path.join(args.output_dir, "wiki-{:}".format(i*num_jobs+job_id)), "wb") as f:
+        #     pickle.dump(total_sentence, f)
+        # print(np.array(total_sentence).astype(np.int16))
+        # print(total_sentence)
+        np.save(fname, total_sentence)
         elapsed = time.time() - start_time
         print("processed {:}/{:} files ({:.1f}%), ELAPSED: {:}s id: {:} len: {:}".format(i+1, len(data), 100.0*(i+1)/len(data), int(elapsed), job_id, len(total_sentence)))
 
@@ -82,7 +146,7 @@ def main():
     print("loaded wiki datasets")
 
     if args.num_processes == 1:
-        write_examples(0, wiki_data[0], args)
+        write_examples(0, wiki_data[0][:10], args)
     else:
         jobs = []
         for i in range(args.num_processes):

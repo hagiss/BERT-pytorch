@@ -1,7 +1,11 @@
 from torch.utils.data import Dataset
-import tqdm
+from tqdm import tqdm
 import torch
 import random
+import numpy as np
+import os
+import gc
+import time
 
 
 class BERTDataset(Dataset):
@@ -14,43 +18,74 @@ class BERTDataset(Dataset):
         self.corpus_path = corpus_path
         self.encoding = encoding
 
-        with open(corpus_path, "r", encoding=encoding) as f:
-            if self.corpus_lines is None and not on_memory:
-                for _ in tqdm.tqdm(f, desc="Loading Dataset", total=corpus_lines):
-                    self.corpus_lines += 1
+        if corpus_lines is None:
+            self.corpus_lines = []
 
-            if on_memory:
-                self.lines = [line[:-1].split("\t")
-                              for line in tqdm.tqdm(f, desc="Loading Dataset", total=corpus_lines)]
-                self.corpus_lines = len(self.lines)
+        j = 0
+        for folder in tqdm(os.listdir(corpus_path)):
+            folder_path = os.path.join(corpus_path, folder)
+            for file in os.listdir(folder_path):
+                document = np.load(os.path.join(folder_path, file))
+                for i in document:
+                    self.corpus_lines.append(i)
+                del document
+            # print("{:}:{:} {:1f}% ELAPSED: {:}".format(j, len(os.listdir(corpus_path)), 100.0*j/len(os.listdir(corpus_path)), int(time.time()-start_time)))
+            # j += 1
 
-        if not on_memory:
-            self.file = open(corpus_path, "r", encoding=encoding)
-            self.random_file = open(corpus_path, "r", encoding=encoding)
+        gc.collect()
 
-            for _ in range(random.randint(self.corpus_lines if self.corpus_lines < 1000 else 1000)):
-                self.random_file.__next__()
+        # with open(corpus_path, "r", encoding=encoding) as f:
+        #     if self.corpus_lines is None and not on_memory:
+        #         for _ in tqdm.tqdm(f, desc="Loading Dataset", total=corpus_lines):
+        #             self.corpus_lines += 1
+        #
+        #     if on_memory:
+        #         self.lines = [line[:-1].split("\t")
+        #                       for line in tqdm.tqdm(f, desc="Loading Dataset", total=corpus_lines)]
+        #         self.corpus_lines = len(self.lines)
+        #
+        # if not on_memory:
+        #     self.file = open(corpus_path, "r", encoding=encoding)
+        #     self.random_file = open(corpus_path, "r", encoding=encoding)
+        #
+        #     for _ in range(random.randint(self.corpus_lines if self.corpus_lines < 1000 else 1000)):
+        #         self.random_file.__next__()
 
     def __len__(self):
-        return self.corpus_lines
+        return len(self.corpus_lines)
 
     def __getitem__(self, item):
-        t1, t2, is_next_label = self.random_sent(item)
-        t1_random, t1_label = self.random_word(t1)
-        t2_random, t2_label = self.random_word(t2)
+        # t1, t2, is_next_label = self.random_sent(item)
+        # t1_random, t1_label = self.random_word(t1)
+        # t2_random, t2_label = self.random_word(t2)
+        #
+        # # [CLS] tag = SOS tag, [SEP] tag = EOS tag
+        # t1 = [self.vocab.sos_index] + t1_random + [self.vocab.eos_index]
+        # t2 = t2_random + [self.vocab.eos_index]
+        #
+        # bert_input = (t1 + t2)[:self.seq_len]
+        #
+        # padding = [self.vocab.pad_index for _ in range(self.seq_len - len(bert_input))]
+        # bert_input.extend(padding)
 
-        # [CLS] tag = SOS tag, [SEP] tag = EOS tag
-        t1 = [self.vocab.sos_index] + t1_random + [self.vocab.eos_index]
-        t2 = t2_random + [self.vocab.eos_index]
+        s = self.get_sent(item)
+        bert_input = (self.byol_aug(s), self.byol_aug(s))
 
-        bert_input = (t1 + t2)[:self.seq_len]
+        # output = {"bert_input": bert_input}
 
-        padding = [self.vocab.pad_index for _ in range(self.seq_len - len(bert_input))]
-        bert_input.extend(padding)
+        return torch.tensor(bert_input, dtype=torch.int)
 
-        output = {"bert_input": bert_input}
+    def byol_aug(self, tokens):
+        pad_num = np.count_nonzero(tokens == self.vocab["[PAD]"])
+        # pad_num = tokens.count(self.vocab["[PAD]"])
+        token_len = len(tokens) - pad_num - 1
+        if pad_num > 0:
+            for _ in range(min(5, pad_num)):
+                insert_pos = random.randint(1, token_len)
+                np.insert(tokens, insert_pos, self.vocab["[SEP]"])
+                token_len += 1
 
-        return {key: torch.tensor(value) for key, value in output.items()}
+        return tokens[:self.seq_len]
 
     def random_word(self, sentence, already):
         tokens = sentence.split()
@@ -81,6 +116,9 @@ class BERTDataset(Dataset):
 
         return tokens, output_label
 
+    def get_sent(self, index):
+        return self.get_corpus_line(index)
+
     def random_sent(self, index):
         t1, t2 = self.get_corpus_line(index)
 
@@ -93,7 +131,8 @@ class BERTDataset(Dataset):
 
     def get_corpus_line(self, item):
         if self.on_memory:
-            return self.lines[item][0], self.lines[item][1]
+            # return self.lines[item][0], self.lines[item][1]
+            return self.corpus_lines[item]
         else:
             line = self.file.__next__()
             if line is None:
