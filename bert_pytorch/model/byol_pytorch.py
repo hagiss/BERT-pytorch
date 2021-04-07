@@ -36,14 +36,12 @@ def set_requires_grad(model, val):
         p.requires_grad = val
 
 # loss fn
-
 def loss_fn(x, y):
     x = F.normalize(x, dim=-1, p=2)
     y = F.normalize(y, dim=-1, p=2)
     return 2 - 2 * (x * y).sum(dim=-1)
 
 # augmentation utils
-
 class RandomApply(nn.Module):
     def __init__(self, fn, p):
         super().__init__()
@@ -76,15 +74,22 @@ def update_moving_average(ema_updater, ma_model, current_model):
 class MLP(nn.Module):
     def __init__(self, dim, projection_size, hidden_size = 4096):
         super().__init__()
+        self.projection_size = projection_size
+        self.dim = dim
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_size),
             nn.BatchNorm1d(hidden_size),
-            nn.ReLU(inplace=True),
+            nn.Tanh(),
             nn.Linear(hidden_size, projection_size)
         )
 
     def forward(self, x):
-        return self.net(x)
+        size = x.size(0)
+        x = x.view(-1, self.dim)
+        ret = self.net(x)
+        ret = ret.view(size, -1, self.projection_size)
+
+        return ret
 
 # a wrapper class for the base neural network
 # will manage the interception of the hidden layer output
@@ -126,7 +131,7 @@ class NetWrapper(nn.Module):
     @singleton('projector')
     def _get_projector(self, hidden):
         # print(hidden.shape)
-        _, dim = hidden.shape
+        _, _, dim = hidden.shape
         projector = MLP(dim, self.projection_size, self.projection_hidden_size)
         return projector.to(hidden)
 
@@ -146,14 +151,14 @@ class NetWrapper(nn.Module):
         return hidden
 
     def forward(self, x, return_embedding = False):
-        representation = self.get_representation(x)[:, 0]
+        representation = self.get_representation(x)
         # print(representation.shape)
         if return_embedding:
             return representation
 
         projector = self._get_projector(representation)
         projection = projector(representation)
-        return projection, representation
+        return projection
 
 # main class
 
@@ -162,7 +167,6 @@ class BYOL(nn.Module):
         self,
         net,
         sequence_size,
-        encoder_size,
         hidden_layer = -2,
         projection_size = 256,
         projection_hidden_size = 4096,
@@ -171,6 +175,7 @@ class BYOL(nn.Module):
     ):
         super().__init__()
         self.net = net
+        self.seq_len = sequence_size
 
         self.online_encoder = NetWrapper(net, projection_size, projection_hidden_size, layer=hidden_layer)
 
@@ -185,7 +190,8 @@ class BYOL(nn.Module):
         self.to(device)
 
         # send a mock image tensor to instantiate singleton parameters
-        self.forward(torch.randint(0, 1000, (3, 2, sequence_size), device=device))
+        self.forward(torch.randint(0, 1000, (3, 2, sequence_size), device=device),
+                      torch.randint(0, 1, (3, 2, sequence_size), device=device))
 
     @singleton('target_encoder')
     def _get_target_encoder(self):
@@ -202,27 +208,39 @@ class BYOL(nn.Module):
         assert self.target_encoder is not None, 'target encoder has not been created yet'
         update_moving_average(self.target_ema_updater, self.target_encoder, self.online_encoder)
 
-    def forward(self, x, return_embedding=False):
+    def forward(self, x, y, return_embedding=False):
         if return_embedding:
             return self.online_encoder(x)
 
         sentence1, sentence2 = x[:, 0], x[:, 1]
+        mask1, mask2 = y[:, 0], y[:, 1]
 
-        online_proj_one, _ = self.online_encoder(sentence1)
-        online_proj_two, _ = self.online_encoder(sentence2)
+        online_proj_one = self.online_encoder(sentence1)
+        online_proj_two = self.online_encoder(sentence2)
 
         online_pred_one = self.online_predictor(online_proj_one)
         online_pred_two = self.online_predictor(online_proj_two)
 
         with torch.no_grad():
             target_encoder = self._get_target_encoder() if self.use_momentum else self.online_encoder
-            target_proj_one, _ = target_encoder(sentence1)
-            target_proj_two, _ = target_encoder(sentence2)
-            target_proj_one.detach_()
-            target_proj_two.detach_()
+            target_proj_one = target_encoder(sentence1)
+            target_proj_two = target_encoder(sentence2)
+            # target_proj_one.detach_()
+            # target_proj_two.detach_()
 
-        loss_one = loss_fn(online_pred_one, target_proj_two.detach())
-        loss_two = loss_fn(online_pred_two, target_proj_one.detach())
+        loss_one = loss_fn(online_pred_one, target_proj_two.detach()) * mask1
+        loss_two = loss_fn(online_pred_two, target_proj_one.detach()) * mask2
 
-        loss = loss_one + loss_two
-        return loss.mean()
+        loss_sum = loss_one + loss_two
+        loss_repr, loss_mask = torch.split(loss_sum, [1, self.seq_len-1], dim=-1)
+
+        # loss_repr = (loss_one[:, 0] + loss_two[:, 0]) / 2
+        #
+        # loss_mask = (loss_one[:, 1:] + loss_two[:, 1:]) / 2
+
+        alpha = 1
+        beta = 1
+
+        loss = (alpha * loss_repr.mean() + beta * loss_mask.mean()) / 2
+
+        return loss

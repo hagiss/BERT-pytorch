@@ -11,6 +11,9 @@ from dataset import BERTDataset
 from transformers import BertTokenizer
 import pytorch_lightning as pl
 
+from transformers import AdamW, get_linear_schedule_with_warmup
+
+
 
 class BERTTrainer(pl.LightningModule):
     """
@@ -23,7 +26,7 @@ class BERTTrainer(pl.LightningModule):
 
     """
 
-    def __init__(self, bert: BERT, proj_size,
+    def __init__(self, bert: BERT, proj_size, seq_len,
                  lr: float = 1e-4, betas=(0.9, 0.999), weight_decay: float = 0.01, warmup_steps=10000,
                  log_freq: int = 10):
         super().__init__()
@@ -38,6 +41,7 @@ class BERTTrainer(pl.LightningModule):
         :param with_cuda: traning with cuda
         :param log_freq: logging frequency of the batch iteration
         """
+        self.lr = lr
         self.warmup_steps = warmup_steps
         self.current_step = 1
         # cuda_condition = torch.cuda.is_available()
@@ -47,7 +51,7 @@ class BERTTrainer(pl.LightningModule):
         # This BERT model will be saved every epoch
         self.bert = bert
         # Initialize the BERT Language Model, with BERT model
-        self.model = BYOL(bert, proj_size, bert.hidden)
+        self.model = BYOL(bert, sequence_size=seq_len, projection_size=proj_size)
         # SelfSupervisedLearner(
         #     bert,
         #     image_size = ,
@@ -58,8 +62,11 @@ class BERTTrainer(pl.LightningModule):
         # )
 
         # Setting the Adam optimizer with hyper-param
-        self.optim = Adam(self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
         self.log_freq = log_freq
+
+        self.example_input_array = (torch.randint(0, 1000, (128, 2, 128)), torch.randint(0, 1, (128, 2, 128)))
+
+        self.save_hyperparameters()
 
         print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
 
@@ -72,26 +79,35 @@ class BERTTrainer(pl.LightningModule):
             np.power(self.current_step, -0.5),
             np.power(self.warmup_steps, -1.5) * self.current_step])
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, y):
+        return self.model(x, y)
 
-    def training_step(self, tokens, _):
-        if self.global_step == 1:
-            aa = torch.randint(0, 1000, (3, 2, 128)).to(self.device)
-            self.logger.experiment.add_graph(self.model, aa)
+    def training_step(self, batch, _):
+        if self.global_step == 0:
+            aa = self.example_input_array[0].to(self.device)
+            bb = self.example_input_array[1].to(self.device)
+            self.logger.experiment.add_graph(self.model, (aa, bb))
 
-        loss = self.forward(tokens)
+        x, y = batch
+
+        loss = self.forward(x, y)
         self.current_step += 1
-        self.log('train_loss', loss, on_step=True, prog_bar=True)
-        self.log('lr', self.get_lr(), on_step=True, prog_bar=True)
+        self.logger.experiment.add_scalar('train_loss', loss.detach().item(), self.global_step)
+        self.logger.experiment.add_scalar('lr', self.get_lr(), self.global_step)
+        # print(self.global_step)
+        # if self.global_step % 10 == 0:
+        #     gc.collect()
         return {'loss': loss}
 
     def configure_optimizers(self):
+        parameters = list(self.parameters())
+        trainable_parameters = list(filter(lambda p: p.requires_grad, parameters))
+        optimizer = AdamW(trainable_parameters, lr=self.lr, eps=1e-8)
         scheduler = LambdaLR(
-            self.optim,
+            optimizer,
             lr_lambda=self.lr_foo
         )
-        return [self.optim], [{
+        return [optimizer], [{
                 'scheduler': scheduler,
                 'interval': 'step',
                 'frequency': 1,
@@ -103,6 +119,35 @@ class BERTTrainer(pl.LightningModule):
             self.model.update_moving_average()
 
 
+class InputMonitor(pl.Callback):
+    def on_train_batch_start(self, pl_trainer, pl_module, batch, batch_idx, dataloader_idx):
+        if batch_idx % 100 == 0:
+            x, y = batch
+            sample_input = x[:, 0]
+            sample_output = pl_module.model.online_encoder.get_representation(sample_input.to(pl_module.device))[0]
+            pl_logger = pl_trainer.logger
+            pl_logger.experiment.add_histogram("input", x, global_step=pl_trainer.global_step)
+            pl_logger.experiment.add_histogram("mask", y, global_step=pl_trainer.global_step)
+            pl_logger.experiment.add_histogram("repr_cls", sample_output[0, :], global_step=pl_trainer.global_step)
+            pl_logger.experiment.add_histogram("repr_first", sample_output[1, :], global_step=pl_trainer.global_step)
+
+    # def on_train_start(self, trainer, pl_model):
+    #     n = 0
+    #
+    #     example_input1, example_input2 = pl_model.example_input_array
+    #     example_input1.requires_grad = True
+    #
+    #     pl_model.zero_grad()
+    #     output = pl_model(example_input1.to(pl_model.device), example_input2.to(pl_model.device))
+    #     output[n].abs().sum().backward()
+    #
+    #     zero_grad_inds = list(range(example_input1.size(0)))
+    #     zero_grad_inds.pop(n)
+    #
+    #     if example_input1.grad[zero_grad_inds].abs().sum().item() > 0:
+    #         raise RuntimeError("Your model mixes data across the batch dimension!")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
@@ -111,15 +156,16 @@ if __name__ == '__main__':
     # parser.add_argument("-v", "--vocab_path", required=True, type=str, help="built vocab model path with bert-vocab")
     parser.add_argument("-o", "--output_path", required=True, type=str, help="ex)output/bert.model")
 
-    parser.add_argument("-hs", "--hidden", type=int, default=256, help="hidden size of transformer model")
-    parser.add_argument("-l", "--layers", type=int, default=8, help="number of layers")
-    parser.add_argument("-a", "--attn_heads", type=int, default=8, help="number of attention heads")
+    parser.add_argument("-hs", "--hidden", type=int, default=768, help="hidden size of transformer model")
+    parser.add_argument("-l", "--layers", type=int, default=12, help="number of layers")
+    parser.add_argument("-a", "--attn_heads", type=int, default=12, help="number of attention heads")
     parser.add_argument("-s", "--seq_len", type=int, default=128, help="maximum sequence len")
-    parser.add_argument("-p", "--proj_size", type=int, default=128, help="byol projection size")
+    parser.add_argument("-p", "--proj_size", type=int, default=256, help="byol projection size")
 
     parser.add_argument("-b", "--batch_size", type=int, default=256, help="number of batch_size")
     parser.add_argument("-e", "--epochs", type=int, default=10, help="number of epochs")
     parser.add_argument("-w", "--num_workers", type=int, default=5, help="dataloader worker size")
+    parser.add_argument("-ac", "--accumulate", type=int, default=16, help="batch accumulate num")
 
     parser.add_argument("--with_cuda", type=bool, default=True, help="training with CUDA: true, or false")
     parser.add_argument("--log_freq", type=int, default=10, help="printing loss every n iter: setting n")
@@ -127,8 +173,8 @@ if __name__ == '__main__':
     parser.add_argument("--cuda_devices", type=int, nargs='+', default=None, help="CUDA device ids")
     parser.add_argument("--on_memory", type=bool, default=True, help="Loading on memory: true or false")
 
-    parser.add_argument("--lr", type=float, default=1e-4, help="learning rate of adam")
-    parser.add_argument("--adam_weight_decay", type=float, default=0.01, help="weight_decay of adam")
+    parser.add_argument("--lr", type=float, default=1e-5, help="learning rate of adam")
+    parser.add_argument("--adam_weight_decay", type=float, default=0.0004, help="weight_decay of adam")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="adam first beta value")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="adam first beta value")
 
@@ -155,24 +201,25 @@ if __name__ == '__main__':
     print("Building BERT model")
     bert = BERT(len(vocab), hidden=args.hidden, n_layers=args.layers, attn_heads=args.attn_heads)
 
-    args.lr = args.lr * args.batch_size / 256
+    args.lr = args.lr * args.batch_size * args.accumulate / 256
 
     print("Creating BERT Trainer")
-    model = BERTTrainer(bert, proj_size=args.proj_size,
+    model = BERTTrainer(bert, proj_size=args.proj_size, seq_len=args.seq_len,
                         lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
                         log_freq=args.log_freq)
 
-    logger = pl.loggers.TensorBoardLogger('log', name='byol_test')
+    logger = pl.loggers.TensorBoardLogger('log', name='byol_mask')
 
     trainer = pl.Trainer(
         gpus=torch.cuda.device_count(),
         max_epochs=args.epochs,
-        accumulate_grad_batches=1,
+        accumulate_grad_batches=args.accumulate,
         sync_batchnorm=True,
         default_root_dir=args.output_path,
         # log_save_interval=args.log_freq,
         accelerator='ddp',
-        logger=logger
+        logger=logger,
+        callbacks=[InputMonitor()]
     )
 
     print("Training Start")
